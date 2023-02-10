@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::io::{Read, Write};
 
@@ -24,6 +25,7 @@ pub struct Interpreter {
     data: [u8; 30000],
     d_offset: usize,
     i_offset: usize,
+    pair_map: HashMap<usize, usize>,
 }
 
 impl Interpreter {
@@ -33,6 +35,7 @@ impl Interpreter {
             data: [0; 30000],
             d_offset: 0,
             i_offset: 0,
+            pair_map: HashMap::new(),
         }
     }
 
@@ -72,6 +75,26 @@ impl Interpreter {
 
     fn loop_end(&mut self) {
         //cur is [
+        self.i_offset = self
+            .pair_map
+            .get(&self.i_offset)
+            .map(|o| *o)
+            .or_else(|| {
+                let (left, right) = self.left2right();
+                self.cache(left, right);
+                Some(right)
+            })
+            .unwrap();
+    }
+
+    fn cache(&mut self, left: usize, right: usize) {
+        self.pair_map.insert(left, right);
+        self.pair_map.insert(right, left);
+    }
+
+    fn left2right(&mut self) -> (usize, usize) {
+        let left = self.i_offset;
+        let mut right = self.i_offset;
         let mut cnt = 1;
         for i in self.i_offset + 1..self.inst.len() {
             match self.inst[i] {
@@ -79,33 +102,50 @@ impl Interpreter {
                 b']' => {
                     cnt -= 1;
                     if cnt == 0 {
-                        self.i_offset = i;
+                        right = i;
                         break;
                     }
                 }
                 _ => {}
             }
         }
-        assert_eq!(self.inst[self.i_offset], b']', "bad code!");
+        assert_eq!(self.inst[right], b']', "bad code!");
+        (left, right)
     }
 
     fn loop_back(&mut self) {
         //cur is ]
+        self.i_offset = self
+            .pair_map
+            .get(&self.i_offset)
+            .map(|o| *o)
+            .or_else(|| {
+                let (right, left) = self.right2left();
+                self.cache(left, right);
+                Some(left)
+            })
+            .unwrap();
+    }
+
+    fn right2left(&mut self) -> (usize, usize) {
         let mut cnt = 1;
+        let right = self.i_offset;
+        let mut left = self.i_offset;
         for i in (0..self.i_offset).rev() {
             match self.inst[i] {
                 b']' => cnt += 1,
                 b'[' => {
                     cnt -= 1;
                     if cnt == 0 {
-                        self.i_offset = i;
+                        left = i;
                         break;
                     }
                 }
                 _ => {}
             }
         }
-        assert_eq!(self.inst[self.i_offset], b'[', "bad code!");
+        assert_eq!(self.inst[left], b'[', "bad code!");
+        (right, left)
     }
 
     fn incr(&mut self) {
@@ -136,6 +176,7 @@ mod tests {
             data: [0; 30000],
             d_offset: 0,
             i_offset: 0,
+            pair_map: HashMap::new(),
         };
         i.loop_end();
         assert_eq!(4, i.i_offset);
@@ -148,6 +189,7 @@ mod tests {
             data: [0; 30000],
             d_offset: 0,
             i_offset: 4,
+            pair_map: HashMap::new(),
         };
         i.loop_back();
         assert_eq!(0, i.i_offset);

@@ -10,5 +10,5 @@ fn main() {
     let args = Cli::parse();
     let code = std::fs::read_to_string(&args.path).expect("could not read file");
     let result = Interpreter::new(&code).execute();
-    println!("output: {}", unsafe { String::from_utf8_unchecked(result) });
+    println!("{}", unsafe { String::from_utf8_unchecked(result) });
 }
