@@ -1,202 +1,359 @@
-use std::collections::HashMap;
-use std::io;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::io::{Read, Write};
 
-fn parse_inst(code: &str) -> Vec<u8> {
-    code.as_bytes()
-        .iter()
-        .filter(|c| {
-            let c = **c;
-            c == b'>'
-                || c == b'<'
-                || c == b'+'
-                || c == b'-'
-                || c == b'.'
-                || c == b','
-                || c == b'['
-                || c == b']'
-        })
-        .map(|c| *c)
-        .collect::<Vec<u8>>()
+use crate::interpreter::Op::{Add, In, JmpNz, JmpZ, Move, Out};
+
+#[derive(Debug, PartialEq)]
+enum Op {
+    Move { d: isize },
+    Add { d: isize },
+    Out,
+    In,
+    JmpZ { addr: usize },
+    JmpNz { addr: usize },
 }
 
+#[derive(Debug)]
+struct LeftBracketInfo {
+    line: usize,
+    col: usize,
+    addr: usize,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum BuildErrorKind {
+    BracketNotMatch,
+    BracketNotClosed,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct BuildError {
+    line: usize,
+    col: usize,
+    kind: BuildErrorKind,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum RuntimeErrorKind {
+    DataOverflow { idx: isize },
+    IO { err: String },
+}
+
+#[derive(Debug, PartialEq)]
+pub struct RuntimeError {
+    kind: RuntimeErrorKind,
+}
+
+impl Display for RuntimeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            RuntimeErrorKind::DataOverflow { idx } => write!(f, "data overflow, idx = {}", idx),
+            RuntimeErrorKind::IO { err } => write!(f, "io err: {}", err),
+        }
+    }
+}
+
+impl Error for RuntimeError {}
+
+#[derive(Debug)]
 pub struct Interpreter {
-    inst: Vec<u8>,
-    data: [u8; 30000],
-    d_offset: usize,
-    i_offset: usize,
-    pair_map: HashMap<usize, usize>,
+    ops: Vec<Op>,
 }
 
 impl Interpreter {
-    pub fn new(code: &str) -> Self {
-        Self {
-            inst: parse_inst(code),
-            data: [0; 30000],
-            d_offset: 0,
-            i_offset: 0,
-            pair_map: HashMap::new(),
-        }
-    }
-
-    pub fn execute(&mut self) -> Vec<u8> {
+    pub fn build(code: &str) -> Result<Self, BuildError> {
+        let bytes = code.as_bytes().iter().map(|c| *c).collect::<Vec<u8>>();
         let mut result = vec![];
-        while self.i_offset < self.inst.len() {
-            let ins = self.inst[self.i_offset];
-            match ins {
-                b'>' => self.d_offset += 1,
-                b'<' => self.d_offset -= 1,
-                b'+' => self.incr(),
-                b'-' => self.decr(),
-                b'.' => result.push(self.data[self.d_offset]),
+        let mut line = 1usize;
+        let mut col = 1usize;
+        let mut i = 0;
+        let mut jmp_stack = vec![];
+        while i < bytes.len() {
+            let c = bytes[i];
+            match c {
+                b'<' | b'>' => {
+                    let mut delta = if c == b'<' { -1 } else { 1 };
+                    while i + 1 < bytes.len() && (bytes[i + 1] == b'<' || bytes[i + 1] == b'>') {
+                        delta += if bytes[i + 1] == b'<' { -1 } else { 1 };
+                        i += 1;
+                    }
+                    if delta != 0 {
+                        result.push(Move { d: delta });
+                    }
+                }
+                b'+' | b'-' => {
+                    let mut delta = if c == b'-' { -1 } else { 1 };
+                    while i + 1 < bytes.len() && (bytes[i + 1] == b'-' || bytes[i + 1] == b'+') {
+                        delta += if bytes[i + 1] == b'-' { -1 } else { 1 };
+                        i += 1;
+                    }
+                    if delta != 0 {
+                        result.push(Add { d: delta });
+                    }
+                }
+                b'.' => {
+                    result.push(Out);
+                }
                 b',' => {
-                    print!("> ");
-                    io::stdout().flush().unwrap();
-                    let mut buf = [0; 2];
-                    io::stdin().read_exact(&mut buf).unwrap();
-                    self.data[self.d_offset] = buf[0];
+                    result.push(In);
                 }
                 b'[' => {
-                    if self.data[self.d_offset] == 0 {
-                        self.loop_end()
-                    }
+                    result.push(JmpZ { addr: 0 });
+                    jmp_stack.push(LeftBracketInfo {
+                        line,
+                        col,
+                        addr: result.len(),
+                    });
                 }
-                b']' => {
-                    if self.data[self.d_offset] != 0 {
-                        self.loop_back()
+                b']' => match jmp_stack.pop() {
+                    Some(info) => {
+                        result.push(JmpNz { addr: info.addr });
+                        result[info.addr - 1] = JmpZ { addr: result.len() };
                     }
-                }
-                _ => panic!("unexpected instruction: {}", ins),
-            }
-            self.i_offset += 1;
-        }
-        result
-    }
-
-    fn loop_end(&mut self) {
-        //cur is [
-        self.i_offset = self
-            .pair_map
-            .get(&self.i_offset)
-            .map(|o| *o)
-            .or_else(|| {
-                let (left, right) = self.left2right();
-                self.cache(left, right);
-                Some(right)
-            })
-            .unwrap();
-    }
-
-    fn cache(&mut self, left: usize, right: usize) {
-        self.pair_map.insert(left, right);
-        self.pair_map.insert(right, left);
-    }
-
-    fn left2right(&mut self) -> (usize, usize) {
-        let left = self.i_offset;
-        let mut right = self.i_offset;
-        let mut cnt = 1;
-        for i in self.i_offset + 1..self.inst.len() {
-            match self.inst[i] {
-                b'[' => cnt += 1,
-                b']' => {
-                    cnt -= 1;
-                    if cnt == 0 {
-                        right = i;
-                        break;
+                    None => {
+                        return Err(BuildError {
+                            line,
+                            col,
+                            kind: BuildErrorKind::BracketNotMatch,
+                        });
                     }
+                },
+                b'\n' => {
+                    line += 1;
+                    col = 0;
                 }
                 _ => {}
             }
+            col += 1;
+            i += 1;
         }
-        assert_eq!(self.inst[right], b']', "bad code!");
-        (left, right)
+
+        if let Some(info) = jmp_stack.pop() {
+            return Err(BuildError {
+                line: info.line,
+                col: info.col,
+                kind: BuildErrorKind::BracketNotClosed,
+            });
+        }
+
+        Ok(Self { ops: result })
     }
 
-    fn loop_back(&mut self) {
-        //cur is ]
-        self.i_offset = self
-            .pair_map
-            .get(&self.i_offset)
-            .map(|o| *o)
-            .or_else(|| {
-                let (right, left) = self.right2left();
-                self.cache(left, right);
-                Some(left)
-            })
-            .unwrap();
-    }
+    pub fn execute(&self, read: &mut dyn Read, write: &mut dyn Write) -> Result<(), RuntimeError> {
+        let mut data = [0u8; 30000];
+        let mut d_offset = 0usize; // 0~29999
+        let mut i_offset = 0usize;
 
-    fn right2left(&mut self) -> (usize, usize) {
-        let mut cnt = 1;
-        let right = self.i_offset;
-        let mut left = self.i_offset;
-        for i in (0..self.i_offset).rev() {
-            match self.inst[i] {
-                b']' => cnt += 1,
-                b'[' => {
-                    cnt -= 1;
-                    if cnt == 0 {
-                        left = i;
-                        break;
+        while i_offset < self.ops.len() {
+            match self.ops[i_offset] {
+                Move { d } => {
+                    if d < 0 && -d as usize > d_offset || d_offset as isize + d >= 30000 {
+                        return Err(RuntimeError {
+                            kind: RuntimeErrorKind::DataOverflow {
+                                idx: d_offset as isize + d,
+                            },
+                        });
+                    }
+                    d_offset = (d_offset as isize + d) as usize;
+                }
+                Add { d } => data[d_offset] = (data[d_offset] as isize + d) as u8,
+                Out => {
+                    write
+                        .write(&data[d_offset..d_offset + 1])
+                        .map_err(|err| RuntimeError {
+                            kind: RuntimeErrorKind::IO {
+                                err: err.to_string(),
+                            },
+                        })?;
+                }
+                In => {
+                    read.read_exact(&mut data[d_offset..d_offset + 1])
+                        .map_err(|err| RuntimeError {
+                            kind: RuntimeErrorKind::IO {
+                                err: err.to_string(),
+                            },
+                        })?;
+                }
+                JmpZ { addr } => {
+                    if data[d_offset] == 0 {
+                        i_offset = addr - 1;
                     }
                 }
-                _ => {}
+                JmpNz { addr } => {
+                    if data[d_offset] != 0 {
+                        i_offset = addr - 1;
+                    }
+                }
             }
-        }
-        assert_eq!(self.inst[left], b'[', "bad code!");
-        (right, left)
-    }
 
-    fn incr(&mut self) {
-        if self.data[self.d_offset] == u8::MAX {
-            self.data[self.d_offset] = 0;
-        } else {
-            self.data[self.d_offset] += 1;
+            i_offset += 1;
         }
-    }
 
-    fn decr(&mut self) {
-        if self.data[self.d_offset] == 0 {
-            self.data[self.d_offset] = u8::MAX;
-        } else {
-            self.data[self.d_offset] -= 1;
-        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
-    #[test]
-    fn test_loop_end() {
-        let mut i = Interpreter {
-            inst: vec![b'[', b'[', b'>', b']', b']'],
-            data: [0; 30000],
-            d_offset: 0,
-            i_offset: 0,
-            pair_map: HashMap::new(),
-        };
-        i.loop_end();
-        assert_eq!(4, i.i_offset);
+    struct MockInOut {
+        data: VecDeque<u8>,
+        bad: bool,
+    }
+
+    impl MockInOut {
+        fn new(d: Vec<u8>) -> Self {
+            let data = VecDeque::from(d);
+            Self { data, bad: false }
+        }
+
+        fn dummy() -> Self {
+            Self {
+                data: VecDeque::new(),
+                bad: false,
+            }
+        }
+
+        fn bad() -> Self {
+            Self {
+                data: VecDeque::new(),
+                bad: true,
+            }
+        }
+    }
+
+    impl Read for MockInOut {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.bad {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "read"));
+            }
+
+            let mut cnt = 0usize;
+            for i in 0..buf.len() {
+                if let Some(c) = self.data.pop_front() {
+                    buf[i] = c;
+                    cnt += 1;
+                } else {
+                    break;
+                }
+            }
+            Ok(cnt)
+        }
+    }
+
+    impl Write for MockInOut {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.bad {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "write"));
+            }
+
+            for c in buf {
+                self.data.push_back(*c);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
-    fn test_loop_back() {
-        let mut i = Interpreter {
-            inst: vec![b'[', b'[', b'>', b']', b']'],
-            data: [0; 30000],
-            d_offset: 0,
-            i_offset: 4,
-            pair_map: HashMap::new(),
-        };
-        i.loop_back();
-        assert_eq!(0, i.i_offset);
+    fn test_basic() {
+        let code = "<+>-.,[]";
+        let interpreter = Interpreter::build(code).unwrap();
+
+        let expected = vec![
+            Move { d: -1 },
+            Add { d: 1 },
+            Move { d: 1 },
+            Add { d: -1 },
+            Out,
+            In,
+            JmpZ { addr: 8 },
+            JmpNz { addr: 7 },
+        ];
+
+        assert_eq!(expected.len(), interpreter.ops.len());
+        for (idx, op) in interpreter.ops.iter().enumerate() {
+            assert_eq!(expected[idx], *op);
+        }
     }
 
     #[test]
-    fn test_1() {
+    fn test_fold() {
+        let code = "<><<>><+-++--+<>+-";
+        let interpreter = Interpreter::build(code).unwrap();
+
+        let expected = vec![Move { d: -1 }, Add { d: 1 }];
+
+        assert_eq!(expected.len(), interpreter.ops.len());
+        for (idx, op) in interpreter.ops.iter().enumerate() {
+            assert_eq!(expected[idx], *op);
+        }
+    }
+
+    #[test]
+    fn test_not_match() {
+        let code = r#"[[
+]]]+++"#;
+
+        let err = Interpreter::build(code).unwrap_err();
+        assert_eq!(
+            BuildError {
+                line: 2,
+                col: 3,
+                kind: BuildErrorKind::BracketNotMatch,
+            },
+            err
+        );
+    }
+
+    #[test]
+    fn test_not_closed() {
+        let code = r#"[[[
+]]++"#;
+        let err = Interpreter::build(code).unwrap_err();
+        assert_eq!(
+            BuildError {
+                line: 1,
+                col: 1,
+                kind: BuildErrorKind::BracketNotClosed,
+            },
+            err
+        );
+    }
+
+    #[test]
+    fn test_input_output() {
+        let code = ",>,.<.";
+        let inter = Interpreter::build(code).unwrap();
+        let mut input = MockInOut::new(vec![b'h', b'i']);
+        let mut out = MockInOut::dummy();
+        inter.execute(&mut input, &mut out).unwrap();
+        assert_eq!(
+            "ih".as_bytes(),
+            out.data.iter().map(|c| *c).collect::<Vec<u8>>()
+        );
+
+
+        let mut bad_input = MockInOut::bad();
+        let mut bad_output = MockInOut::bad();
+        let err = inter.execute(&mut bad_input, &mut bad_output).unwrap_err();
+        assert_eq!("io err: read", err.to_string());
+
+        let mut input = MockInOut::new(vec![b'h', b'i']);
+        let mut bad_output = MockInOut::bad();
+        let err = inter.execute(&mut input, &mut bad_output).unwrap_err();
+        assert_eq!("io err: write", err.to_string());
+    }
+
+    #[test]
+    fn test_sample1() {
         let code = r#"
 ++       Cell c0 = 2
 > +++++  Cell c1 = 5
@@ -219,11 +376,12 @@ We use a loop to compute 48 = 6 * 8
 ]
 < .        Print out c0 which has the value 55 which translates to "7"!
         "#;
-        let mut inter = Interpreter::new(code);
-        let result = inter.execute();
+        let inter = Interpreter::build(code).unwrap();
+        let mut out = MockInOut::dummy();
+        inter.execute(&mut MockInOut::dummy(), &mut out).unwrap();
 
-        assert_eq!(1, result.len());
-        assert_eq!(55, result[0]);
+        assert_eq!(1, out.data.len());
+        assert_eq!(55, out.data[0]);
     }
 
     #[test]
@@ -273,10 +431,31 @@ Pointer :   ^
 >>+.                    Add 1 to Cell #5 gives us an exclamation point
 >++.                    And finally a newline from Cell #6"#;
 
-        let mut inter = Interpreter::new(code);
-        let result = inter.execute();
+        let inter = Interpreter::build(code).unwrap();
+        let mut out = MockInOut::dummy();
+        inter.execute(&mut MockInOut::dummy(), &mut out).unwrap();
 
-        assert_eq!(13, result.len());
-        assert_eq!("Hello World!\n".as_bytes(), result);
+        assert_eq!(13, out.data.len());
+        assert_eq!(
+            "Hello World!\n".as_bytes(),
+            out.data.iter().map(|c| *c).collect::<Vec<u8>>()
+        );
+    }
+
+    #[test]
+    fn test_data_overflow() {
+        let code = "<";
+        let inter = Interpreter::build(code).unwrap();
+        let err = inter
+            .execute(&mut MockInOut::dummy(), &mut MockInOut::dummy())
+            .unwrap_err();
+        assert_eq!("data overflow, idx = -1", err.to_string());
+
+        let code = String::from_utf8(Vec::from([b'>'; 30000])).unwrap();
+        let inter = Interpreter::build(&code).unwrap();
+        let err = inter
+            .execute(&mut MockInOut::dummy(), &mut MockInOut::dummy())
+            .unwrap_err();
+        assert_eq!("data overflow, idx = 30000", err.to_string());
     }
 }

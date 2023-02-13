@@ -1,7 +1,11 @@
-use brainfuck::interpreter::Interpreter;
+use std::io::{stdin, stdout};
+
 use clap::Parser;
 
+use brainfuck::interpreter::Interpreter;
+
 #[derive(Parser)]
+#[command(author, version, about, long_about = None)]
 struct Cli {
     path: std::path::PathBuf,
 }
@@ -9,6 +13,6 @@ struct Cli {
 fn main() {
     let args = Cli::parse();
     let code = std::fs::read_to_string(&args.path).expect("could not read file");
-    let result = Interpreter::new(&code).execute();
-    println!("{}", unsafe { String::from_utf8_unchecked(result) });
+    let interpreter = Interpreter::build(&code).unwrap();
+    interpreter.execute(&mut stdin(), &mut stdout()).unwrap();
 }
